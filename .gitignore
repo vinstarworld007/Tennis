@@ -1,0 +1,7 @@
+node_modules
+dist
+public/mediapipe
+public/models
+src-tauri/target
+src-tauri/gen
+*.log
