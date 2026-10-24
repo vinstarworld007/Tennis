@@ -4,6 +4,9 @@ import { formatMetric, METRIC_INFO, prepare, PHASE_LABEL, type Prepared, type St
 import { STROKE_LABEL, fmtDate } from '../labels';
 import { store, type Player, type Session, type SessionSummary } from '../storage/db';
 import { cropAround, drawSkeleton, drawTrail, drawVideo, type View } from '../render/overlay';
+import { canExportVideo } from '../render/export';
+import { FrameGrabber } from '../render/grabber';
+import { exportStudioCompare, type CompareSide } from '../render/reel';
 
 interface Choice { sessionId: string; strokeId: string }
 interface Source { session: Session; player: Player; prepared: Prepared; url: string; stroke: Stroke }
@@ -77,6 +80,8 @@ export function CompareView({ playerId, strokeId }: { playerId: string; strokeId
   const [b, setB] = useState<Choice>();
   const [offset, setOffset] = useState(-1.0);
   const [playing, setPlaying] = useState(false);
+  const [labels, setLabels] = useState<[string, string]>(['', '']);
+  const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -123,6 +128,21 @@ export function CompareView({ playerId, strokeId }: { playerId: string; strokeId
     return s.strokes.map((st, i) => ({ value: key({ sessionId: s.id, strokeId: st.id }), label: `${p?.name ?? '?'} · ${s.title} · #${i + 1} ${STROKE_LABEL[st.type]}`, mine: s.playerId === playerId }));
   }), [sessions, players, playerId]);
 
+  const exportSplit = async () => {
+    if (!srcA || !srcB) return;
+    const grabbers = [new FrameGrabber(srcA.url), new FrameGrabber(srcB.url)];
+    const side = (s: Source, g: FrameGrabber, label: string): CompareSide => ({ grabber: g, session: s.session, frames: s.prepared.frames, player: s.player, stroke: s.stroke, label: label.trim() || s.player.name });
+    setBusy('Split video 0%');
+    try {
+      await exportStudioCompare(side(srcA, grabbers[0], labels[0]), side(srcB, grabbers[1], labels[1]), (p) => setBusy(`Split video ${Math.round(p * 100)}%`));
+    } catch (e: any) {
+      alert(`Export failed: ${e?.message ?? e}`);
+    } finally {
+      grabbers.forEach((g) => g.dispose());
+      setBusy(null);
+    }
+  };
+
   const type = srcA?.stroke.type;
   const rows = rules.filter((r) => r.enabled && type && r.strokes.includes(type));
 
@@ -149,6 +169,14 @@ export function CompareView({ playerId, strokeId }: { playerId: string; strokeId
         <span className="time">{offset >= 0 ? '+' : ''}{offset.toFixed(2)} s from contact</span>
         <button onClick={() => { setPlaying(false); setOffset(0); }}>Jump to contact</button>
       </div>
+      {canExportVideo() && (
+        <div className="controls split-export">
+          <input placeholder={srcA ? `Left label (${srcA.player.name})` : 'Left label'} value={labels[0]} onChange={(e) => setLabels([e.target.value, labels[1]])} />
+          <input placeholder={srcB ? `Right label (${srcB.player.name})` : 'Right label'} value={labels[1]} onChange={(e) => setLabels([labels[0], e.target.value])} />
+          {busy ? <span className="muted">{busy}</span> : <button className="primary" disabled={!srcA || !srcB} onClick={exportSplit}>Export split-screen studio video</button>}
+          <span className="muted small">Try labels like PRO and BEGINNER.</span>
+        </div>
+      )}
       {srcA && (
         <table className="metrics-table">
           <thead><tr><th>Phase</th><th>Measure</th><th>Left</th><th>Right</th><th>Target</th></tr></thead>

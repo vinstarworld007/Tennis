@@ -207,3 +207,4 @@ td.good { color: var(--good); } td.fix { color: var(--fix); }
   .sessions, .import, .compare, .trends, .rules { padding: 16px; }
   .rule-texts { grid-template-columns: 1fr; }
 }
+.split-export input { width: 200px; }

@@ -14,7 +14,7 @@ export interface CardContext {
   player: Player;
 }
 
-const frameTime = (s: Session, i: number) => s.start + i / s.fps;
+export const frameTime = (s: Session, i: number) => s.start + i / s.fps;
 
 /** The headline under the phase title: the first fix for that phase, else the first good point. */
 export function phaseSubtitle(stroke: Stroke, phase: Phase): string | undefined {
@@ -50,7 +50,7 @@ export async function renderCard(ctx: CardContext, stroke: Stroke, phase: Phase,
 const toBlob = (c: HTMLCanvasElement, type = 'image/png', q?: number) =>
   new Promise<Blob>((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error('Could not render image'))), type, q));
 
-function baseName(ctx: CardContext, stroke: Stroke) {
+export function baseName(ctx: CardContext, stroke: Stroke) {
   return slug(`${ctx.player.name} ${STROKE_LABEL[stroke.type]} ${ctx.session.title}`);
 }
 
@@ -154,13 +154,7 @@ export async function exportVideo(ctx: CardContext, stroke: Stroke, onProgress?:
   canvas.width = W;
   canvas.height = H;
   const c2d = canvas.getContext('2d')!;
-  const stream = canvas.captureStream(30);
-  const mime = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm'].find((t) => MediaRecorder.isTypeSupported(t)) ?? '';
-  const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8_000_000 } : undefined);
-  const chunks: Blob[] = [];
-  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-  const stopped = new Promise<void>((r) => (rec.onstop = () => r()));
-  rec.start(250);
+  const rec = startRecording(canvas);
 
   const { w: vw, h: vh } = await ctx.grabber.size();
   const crop = cropAround(ctx.frames, stroke.startFrame, stroke.endFrame, vw, vh, W / H);
@@ -187,9 +181,25 @@ export async function exportVideo(ctx: CardContext, stroke: Stroke, onProgress?:
     await wait(1800);
     onProgress?.(++step / totalSteps);
   }
-  rec.stop();
-  await stopped;
-  const type = rec.mimeType || 'video/webm';
-  const ext = type.includes('mp4') ? 'mp4' : 'webm';
-  return saveFile(new Blob(chunks, { type }), `${baseName(ctx, stroke)}.${ext}`, [{ name: 'Video', extensions: [ext] }]);
+  const { blob, ext } = await rec.stop();
+  return saveFile(blob, `${baseName(ctx, stroke)}.${ext}`, [{ name: 'Video', extensions: [ext] }]);
+}
+
+/** Record a canvas as video until `stop()`; MP4 where the system can encode it, else WebM. */
+export function startRecording(canvas: HTMLCanvasElement) {
+  const stream = canvas.captureStream(30);
+  const mime = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm'].find((t) => MediaRecorder.isTypeSupported(t)) ?? '';
+  const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8_000_000 } : undefined);
+  const chunks: Blob[] = [];
+  rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  const stopped = new Promise<void>((r) => (rec.onstop = () => r()));
+  rec.start(250);
+  return {
+    async stop() {
+      rec.stop();
+      await stopped;
+      const type = rec.mimeType || 'video/webm';
+      return { blob: new Blob(chunks, { type }), ext: type.includes('mp4') ? 'mp4' : 'webm' };
+    },
+  };
 }

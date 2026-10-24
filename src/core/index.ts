@@ -7,3 +7,6 @@ export * from './phases';
 export * from './rules';
 export * from './analyze';
 export { cleanFrames, smoothSeries } from './smoothing';
+export * from './weight';
+export * from './ball';
+export * from './racket';
