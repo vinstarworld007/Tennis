@@ -242,8 +242,12 @@ export function drawHeader(v: View, opts: { index: number; title: string; subtit
   }
   ctx.textAlign = 'left';
   ctx.fillStyle = '#ffffff';
+  // Shrink long titles ("FOLLOW-THROUGH") so they never run off the edge.
+  const room = W - pad - titleX;
   ctx.font = `800 ${96 * s}px Inter, system-ui, sans-serif`;
-  ctx.fillText(opts.title.toUpperCase(), titleX, cy + 34 * s);
+  const size = Math.min(96 * s, (96 * s * room) / Math.max(1, ctx.measureText(opts.title.toUpperCase()).width));
+  ctx.font = `800 ${size}px Inter, system-ui, sans-serif`;
+  ctx.fillText(opts.title.toUpperCase(), titleX, cy + size * 0.35);
   y = cy + r + 70 * s;
   if (opts.subtitle) {
     ctx.font = `700 ${48 * s}px Inter, system-ui, sans-serif`;
@@ -256,6 +260,7 @@ export function drawHeader(v: View, opts: { index: number; title: string; subtit
   ctx.font = `700 ${26 * s}px Inter, system-ui, sans-serif`;
   ctx.fillText('ANALYZED BY COURTSIDE', pad, y + 6 * s);
 }
+
 
 export function wrap(ctx: CanvasRenderingContext2D, text: string, maxW: number): string[] {
   const words = text.split(/\s+/);
