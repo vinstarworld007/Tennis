@@ -1,37 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ballAt, estimateRacket, frontShare, LANDMARK_COUNT, trackBall, transferSummary, weightTransfer, type BallCandidate, type ImagePoint, type PoseFrame, type Vec3 } from '../index';
-
-describe('ball tracking', () => {
-  // A ball crossing the frame on an arc, missed for two frames, plus a still ball and random noise.
-  const n = 30;
-  const truth = (f: number) => ({ x: 0.1 + f * 0.025, y: 0.6 - f * 0.02 + f * f * 0.0008 });
-  let seed = 7;
-  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
-  const cands: BallCandidate[][] = [];
-  for (let f = 0; f < n; f++) {
-    const c: BallCandidate[] = [{ x: 0.85, y: 0.9, score: 0.9 }]; // still ball on the court
-    if (f !== 12 && f !== 13) c.push({ ...truth(f), score: 0.8 });
-    if (rnd() < 0.5) c.push({ x: rnd(), y: rnd(), score: 0.6 });
-    cands.push(c);
-  }
-  const track = trackBall(cands, 100);
-
-  it('follows the flight and fills the short gap', () => {
-    let found = 0;
-    for (let f = 0; f < n; f++) {
-      const p = ballAt(track, 100 + f);
-      if (!p) continue;
-      found++;
-      expect(Math.hypot(p.x - truth(f).x, p.y - truth(f).y)).toBeLessThan(0.02);
-    }
-    expect(found).toBeGreaterThanOrEqual(n - 2);
-    expect(ballAt(track, 112)?.interpolated).toBe(true);
-  });
-  it('ignores a ball that is not moving', () => {
-    const still = track.points.map((p, f) => (p?.x === 0.85 ? f : -1)).filter((f) => f >= 0);
-    expect(still).toEqual([]);
-  });
-});
+import { ballFlight, estimateRacket, frontShare, LANDMARK_COUNT, RACKET_LENGTH, strokeSpace, toCourt, transferSummary, weightTransfer, type PoseFrame, type Vec3 } from '../index';
 
 /** A standing figure (world metres, y down) with the feet apart along x and the body leaning by `lean`. */
 function figure(lean: number): Vec3[] {
@@ -65,14 +33,50 @@ describe('weight transfer', () => {
 });
 
 describe('racket estimate', () => {
-  it('extends the hand direction from the wrist', () => {
-    const pts: ImagePoint[] = Array.from({ length: LANDMARK_COUNT }, () => ({ x: 0, y: 0, v: 0 }));
-    pts[14] = { x: 0.4, y: 0.5, v: 1 }; // right elbow
-    pts[16] = { x: 0.5, y: 0.5, v: 1 }; // right wrist
-    pts[20] = { x: 0.52, y: 0.5, v: 1 }; // right index knuckle
-    const r = estimateRacket(pts, 'right', 1)!;
-    expect(r.tip.x).toBeCloseTo(0.75);
-    expect(r.tip.y).toBeCloseTo(0.5);
-    expect(r.head.x).toBeGreaterThan(0.6);
+  it('extends the hand direction from the wrist by a racket length', () => {
+    const w: Vec3[] = Array.from({ length: LANDMARK_COUNT }, () => ({ x: 0, y: 0, z: 0 }));
+    w[14] = { x: 0.2, y: 0, z: 0 }; // right elbow
+    w[16] = { x: 0.45, y: 0, z: 0 }; // right wrist
+    w[18] = { x: 0.53, y: 0, z: -0.02 }; // right pinky knuckle
+    w[20] = { x: 0.53, y: 0, z: 0.02 }; // right index knuckle
+    const r = estimateRacket(w, 'right')!;
+    expect(r.tip.x).toBeCloseTo(0.45 + RACKET_LENGTH);
+    expect(r.tip.y).toBeCloseTo(0);
+    expect(Math.abs(r.face!.y)).toBeCloseTo(1);
+  });
+});
+
+describe('court placement', () => {
+  it('turns the swing toward the net and stands the feet on the floor', () => {
+    // Right wrist swings toward +x in pose space through contact.
+    const frames: PoseFrame[] = [];
+    for (let i = 0; i <= 10; i++) {
+      const w = figure(0);
+      w[16] = { x: -0.5 + i * 0.1, y: -0.3, z: 0 };
+      frames.push({ t: i / 30, world: w, image: null });
+    }
+    const s = strokeSpace(frames, { startFrame: 0, endFrame: 10, contactFrame: 5 }, 'right');
+    const a = toCourt(frames[3].world![16], s);
+    const b = toCourt(frames[7].world![16], s);
+    expect(b.z - a.z).toBeLessThan(-0.3);
+    expect(Math.abs(b.x - a.x)).toBeLessThan(1e-6);
+    expect(toCourt(frames[0].world![31], s).y).toBeCloseTo(0);
+    expect(toCourt(frames[0].world![0], s).y).toBeGreaterThan(1);
+  });
+  it('draws a flight that meets the racket at contact and lands across the net', () => {
+    const frames: PoseFrame[] = [];
+    for (let i = 0; i <= 10; i++) {
+      const w = figure(0);
+      w[14] = { x: -0.6 + i * 0.1, y: -0.3, z: 0 };
+      w[16] = { x: -0.4 + i * 0.1, y: -0.3, z: 0 };
+      frames.push({ t: i / 30, world: w, image: null });
+    }
+    const st = { startFrame: 0, endFrame: 10, contactFrame: 5 };
+    const s = strokeSpace(frames, st, 'right');
+    const f = ballFlight(frames, st, s, 'right', false)!;
+    expect(f.at(0)!.z).toBeCloseTo(f.contact.z);
+    expect(f.at(f.after)!.z).toBeLessThan(0);
+    expect(f.at(f.after)!.y).toBeCloseTo(0);
+    expect(f.at(f.after + 0.1)).toBeNull();
   });
 });

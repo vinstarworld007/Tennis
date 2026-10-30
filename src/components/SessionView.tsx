@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../App';
 import {
-  formatMetric, METRIC_INFO, movePhase, newId, prepare, retypeStroke, strokeAt, topFix,
+  formatMetric, METRIC_INFO, movePhase, newId, prepare, retypeStroke, shareAt, strokeAt, topFix, weightTransfer,
   type AnchorJoint, type Callout, type KeyPoint, type Phase, type Stroke, type StrokeType,
 } from '../core';
 import { STROKE_LABEL, STROKE_TYPES, fmtTime } from '../labels';
@@ -9,8 +9,9 @@ import { store, TAGS, type Player, type Session } from '../storage/db';
 import { drawCallouts, drawSkeleton, drawTrail, drawVideo, fullCrop, type LabelBox, type View } from '../render/overlay';
 import { FrameGrabber } from '../render/grabber';
 import { canExportVideo, exportCarousel, exportPdf, exportVideo, renderCard, type CardContext } from '../render/export';
-import { exportStudioVideo, prepareStudio } from '../render/reel';
-import { drawStudioFrame, type StudioTracks } from '../render/studio';
+import { exportStudioVideo, phaseHeadline } from '../render/reel';
+import { StudioScene } from '../render/scene3d';
+import { loadStudioFonts, renderStudio } from '../render/studio';
 
 const ANCHORS: { id: AnchorJoint; label: string }[] = [
   { id: 'shoulders', label: 'Shoulders' },
@@ -22,9 +23,6 @@ const ANCHORS: { id: AnchorJoint; label: string }[] = [
   { id: 'knee', label: 'Knee' },
   { id: 'head', label: 'Head' },
 ];
-
-/** Tracks depend on the stroke's frames, so a moved contact or re-marked stroke tracks again. */
-const tracksKey = (st: Stroke) => `${st.id}:${st.startFrame}:${st.endFrame}:${st.contactFrame}`;
 
 export function SessionView({ id }: { id: string }) {
   const { go, rules } = useApp();
@@ -40,7 +38,7 @@ export function SessionView({ id }: { id: string }) {
   const [thumbs, setThumbs] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [studio, setStudio] = useState(false);
-  const [tracks, setTracks] = useState<Record<string, StudioTracks>>({});
+  const studioScene = useRef<StudioScene>();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const boxes = useRef<LabelBox[]>([]);
@@ -93,13 +91,13 @@ export function SessionView({ id }: { id: string }) {
   }, [session, save]);
 
   // Drawing reads the latest state through a ref, so the playback loop never sees stale data.
-  const latest = useRef({ session, prepared, stroke, player, coach, selCallout, studio, tracks });
-  latest.current = { session, prepared, stroke, player, coach, selCallout, studio, tracks };
+  const latest = useRef({ session, prepared, stroke, player, coach, selCallout, studio });
+  latest.current = { session, prepared, stroke, player, coach, selCallout, studio };
 
   const draw = useCallback(() => {
     const v = videoRef.current;
     const c = canvasRef.current;
-    const { session: s, prepared: p, stroke: st, player: pl, selCallout: sel, studio: look, tracks: tr } = latest.current;
+    const { session: s, prepared: p, stroke: st, player: pl, selCallout: sel, studio: look } = latest.current;
     if (!v || !c || !s || !p || !pl || !v.videoWidth) return;
     const dpr = window.devicePixelRatio || 1;
     const W = Math.round(c.clientWidth * dpr);
@@ -109,7 +107,17 @@ export function SessionView({ id }: { id: string }) {
     const i = Math.max(0, Math.min(s.frames.length - 1, Math.round((v.currentTime - s.start) * s.fps)));
     const inStroke = st && i >= st.startFrame && i <= st.endFrame ? st : s.strokes.find((x) => i >= x.startFrame && i <= x.endFrame);
     if (look) {
-      drawStudioFrame(view, v, p.frames, inStroke, i, pl.hand, (inStroke && tr[tracksKey(inStroke)]) || { ball: null, weight: null }, { gauge: true });
+      // 3D studio preview; callouts on a paused phase frame show as rings and pinned labels.
+      studioScene.current ??= new StudioScene(W, H);
+      const ph = inStroke && v.paused ? inStroke.phases.find((x) => x.frame === i) : undefined;
+      const weight = inStroke ? weightTransfer(p.frames, inStroke, pl.hand) : null;
+      renderStudio({ ctx: view.ctx, W, H }, studioScene.current, { frames: p.frames, i, fps: s.fps, hand: pl.hand, stroke: inStroke, weight }, {
+        callouts: ph ? inStroke!.callouts.filter((x) => x.phaseId === ph.id) : [],
+        gauge: shareAt(weight, i),
+        headline: ph ? phaseHeadline(inStroke!, ph) : undefined,
+      });
+      boxes.current = [];
+      return;
     } else {
       drawVideo(view, v);
       if (inStroke) drawTrail(view, p.frames, inStroke, i, pl.hand);
@@ -122,19 +130,10 @@ export function SessionView({ id }: { id: string }) {
     }
   }, []);
 
-  useEffect(() => { draw(); }, [draw, session, frame, coach, selCallout, prepared, studio, tracks]);
+  useEffect(() => { draw(); }, [draw, session, frame, coach, selCallout, prepared, studio]);
+  useEffect(() => { if (studio) loadStudioFonts().then(() => draw()); }, [studio, draw]);
+  useEffect(() => () => studioScene.current?.dispose(), []);
 
-  // Studio look: track the ball and weight for the selected stroke once, then reuse.
-  useEffect(() => {
-    if (!studio || !stroke || !grabber.current || !prepared || !session || !player || tracks[tracksKey(stroke)]) return;
-    let cancelled = false;
-    setBusy('Tracking ball 0%');
-    prepareStudio(grabber.current, session, prepared.frames, player, stroke, (p) => !cancelled && setBusy(`Tracking ball ${Math.round(p * 100)}%`))
-      .then((t) => { if (!cancelled) setTracks((all) => ({ ...all, [tracksKey(stroke)]: t })); })
-      .catch((e) => alert(`Ball tracking failed: ${e?.message ?? e}`))
-      .finally(() => !cancelled && setBusy(null));
-    return () => { cancelled = true; setBusy(null); };
-  }, [studio, stroke?.id, stroke?.startFrame, stroke?.endFrame, stroke?.contactFrame, prepared]);
 
   useEffect(() => {
     const onResize = () => draw();
@@ -284,7 +283,7 @@ export function SessionView({ id }: { id: string }) {
           ))}
         </div>
         <div className="spacer" />
-        <label className="toggle" title="White mannequin on a dark court, with racket path, ball flight and weight transfer"><input type="checkbox" checked={studio} onChange={(e) => setStudio(e.target.checked)} /> Studio look</label>
+        <label className="toggle" title="3D mannequin on a virtual court, with racket path, ball flight and weight transfer"><input type="checkbox" checked={studio} onChange={(e) => setStudio(e.target.checked)} /> Studio look</label>
         <label className="toggle"><input type="checkbox" checked={coach} onChange={(e) => setCoach(e.target.checked)} /> Coach editing</label>
         <div className="export">
           {busy ? <span className="muted">{busy}</span> : (
@@ -292,7 +291,7 @@ export function SessionView({ id }: { id: string }) {
               <button disabled={!stroke} onClick={() => runExport('Images', exportCarousel)}>Export images</button>
               <button disabled={!stroke} onClick={() => runExport('PDF', exportPdf)}>PDF report</button>
               {canExportVideo() && <button disabled={!stroke} onClick={() => runExport('Video', exportVideo)}>Vertical video</button>}
-              {canExportVideo() && <button className="primary" disabled={!stroke} onClick={() => runExport('Studio video', (c, st, onP) => exportStudioVideo(c, st, onP, tracks[tracksKey(st)]))}>Studio video</button>}
+              {canExportVideo() && <button className="primary" disabled={!stroke} onClick={() => runExport('Studio video', exportStudioVideo)}>Studio video</button>}
             </>
           )}
         </div>

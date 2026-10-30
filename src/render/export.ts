@@ -1,4 +1,5 @@
 import JSZip from 'jszip';
+import { BufferTarget, CanvasSource, canEncodeVideo, Mp4OutputFormat, Output } from 'mediabunny';
 import { jsPDF } from 'jspdf';
 import { formatMetric, METRIC_INFO, topFix, type Handedness, type Phase, type PoseFrame, type Stroke } from '../core';
 import { STROKE_LABEL } from '../labels';
@@ -201,5 +202,57 @@ export function startRecording(canvas: HTMLCanvasElement) {
       const type = rec.mimeType || 'video/webm';
       return { blob: new Blob(chunks, { type }), ext: type.includes('mp4') ? 'mp4' : 'webm' };
     },
+  };
+}
+
+/** Writes a canvas to video one frame at a time; `time` is the video time written so far, in seconds. */
+export interface FrameWriter {
+  readonly time: number;
+  /** Show the canvas as it is now for `seconds` of video. */
+  add(seconds: number): Promise<void>;
+  finish(): Promise<{ blob: Blob; ext: string }>;
+}
+
+/**
+ * Frame-exact H.264 MP4 through WebCodecs where the system has an encoder, so the result plays at
+ * the right speed however long each frame takes to draw. Elsewhere falls back to recording the
+ * canvas in real time (pacing by waiting), as the older exports do.
+ */
+export async function createFrameWriter(canvas: HTMLCanvasElement, fps = 30): Promise<FrameWriter> {
+  const exact = typeof VideoEncoder !== 'undefined' && (await canEncodeVideo('avc', { width: canvas.width, height: canvas.height }).catch(() => false));
+  if (exact) {
+    const target = new BufferTarget();
+    const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target });
+    const source = new CanvasSource(canvas, { codec: 'avc', bitrate: 8_000_000 });
+    output.addVideoTrack(source, { frameRate: fps });
+    await output.start();
+    let time = 0;
+    return {
+      get time() { return time; },
+      async add(seconds) {
+        // One sample per output frame keeps a constant frame rate, which social apps expect.
+        for (let k = Math.max(1, Math.round(seconds * fps)); k > 0; k--) {
+          await source.add(time, 1 / fps);
+          time += 1 / fps;
+        }
+      },
+      async finish() {
+        await output.finalize();
+        return { blob: new Blob([target.buffer!], { type: 'video/mp4' }), ext: 'mp4' };
+      },
+    };
+  }
+  const rec = startRecording(canvas);
+  let time = 0;
+  let last = performance.now();
+  return {
+    get time() { return time; },
+    async add(seconds) {
+      // Drawing time already counts toward this frame's time on screen.
+      await new Promise((r) => setTimeout(r, Math.max(0, seconds * 1000 - (performance.now() - last))));
+      last = performance.now();
+      time += seconds;
+    },
+    finish: () => rec.stop(),
   };
 }

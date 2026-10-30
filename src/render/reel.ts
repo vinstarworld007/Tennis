@@ -1,164 +1,183 @@
-import { transferSummary, weightTransfer, type Phase, type PoseFrame, type Stroke } from '../core';
+import { topFix, transferSummary, weightTransfer, shareAt, type Callout, type Phase, type PoseFrame, type Stroke, type WeightTransfer } from '../core';
 import { STROKE_LABEL } from '../labels';
 import type { Player, Session } from '../storage/db';
-import { trackBallInVideo } from './ballDetect';
-import { baseName, frameTime, phaseSubtitle, startRecording, type CardContext } from './export';
+import { baseName, createFrameWriter, phaseSubtitle, type CardContext, type FrameWriter } from './export';
 import { saveFile, slug } from './files';
-import type { FrameGrabber } from './grabber';
-import { drawHeader, type View } from './overlay';
-import { drawStudioFrame, studioCrop, type StudioTracks } from './studio';
+import { StudioScene } from './scene3d';
+import { drawHeadline, loadStudioFonts, renderStudio, type Headline, type Surface } from './studio';
 
-/** Ball, weight and racket data for one stroke. The ball is tracked a little before and after the swing. */
-export async function prepareStudio(
-  grabber: FrameGrabber, session: Session, frames: PoseFrame[], player: Player, stroke: Stroke,
-  onProgress?: (p: number) => void,
-): Promise<StudioTracks> {
-  const pad = Math.round(session.fps * 0.5);
-  const from = Math.max(0, stroke.startFrame - pad);
-  const to = Math.min(frames.length - 1, stroke.endFrame + pad);
-  const ball = await trackBallInVideo(grabber, frames, from, to, (i) => frameTime(session, i), onProgress);
-  return { ball, weight: weightTransfer(frames, stroke, player.hand) };
-}
-
-/** "Weight 30% → 74% onto the front foot", or a plain line when the feet were not readable. */
-export function transferLine(tracks: StudioTracks, stroke: Stroke): string {
-  const sum = transferSummary(tracks.weight, stroke.contactFrame);
-  if (!sum) return 'Racket path and ball flight.';
+/** "Weight 30% → 74% onto the front foot", or null when the feet were not readable. */
+export function transferLine(weight: WeightTransfer | null, stroke: Stroke): string | null {
+  const sum = transferSummary(weight, stroke.contactFrame);
+  if (!sum) return null;
   return `Weight ${Math.round(sum.load * 100)}% → ${Math.round(sum.drive * 100)}% onto the front foot.`;
 }
 
-const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/**
+ * Keep a frame on screen for `ms` of video, re-drawing it every few frames so the camera's slow
+ * orbit (driven by video time) keeps moving during holds.
+ */
+async function hold(writer: FrameWriter, ms: number, draw: (videoTime: number) => void) {
+  let left = ms / 1000;
+  do {
+    draw(writer.time);
+    const step = Math.min(left, 2 / 30);
+    await writer.add(step);
+    left -= step;
+  } while (left > 1e-3);
+}
+const phaseCallouts = (st: Stroke, id: Phase['id']) => st.callouts.filter((c) => c.phaseId === id && !c.hidden);
+/** The callout a phase headline leads with: the first fix, else the first good point. */
+const leadCallout = (cs: Callout[]) => cs.find((c) => c.status === 'fix') ?? cs[0];
+
+export function phaseHeadline(stroke: Stroke, p: Phase, total?: number): Headline {
+  const found = leadCallout(phaseCallouts(stroke, p.id));
+  // "TROPHY / TROPHY POSITION." says it twice; drop a second line that repeats the title.
+  const lead = found && !found.label.toLowerCase().includes(p.label.toLowerCase()) ? found : undefined;
+  return {
+    kicker: `Step ${p.index} of ${total ?? stroke.phases.length} · ${STROKE_LABEL[stroke.type]}`,
+    line1: p.label,
+    line2: lead ? `${lead.label}.` : undefined,
+    tone: lead?.status === 'fix' ? 'fix' : 'good',
+    subtitle: phaseSubtitle(stroke, p),
+    dots: { count: total ?? stroke.phases.length, active: p.index - 1 },
+  };
+}
 
 /**
- * A 1080×1920 coach reel in the studio look: a title, then each phase played in slow motion and
- * held with its callouts ("1 UNIT TURN / Shoulders and racket together."), then the full swing
- * with the racket path, ball flight and weight transfer.
+ * A 1080×1920 coach reel in the 3D studio: the player as a mannequin on a virtual court, with a
+ * slowly orbiting camera. A title ("THE PROBLEM / FOREHAND / TURN EARLIER."), then each phase in
+ * slow motion and held with its rings and labels, then the full swing with the ball flight and
+ * the weight shift summed up.
  */
-export async function exportStudioVideo(ctx: CardContext, stroke: Stroke, onProgress?: (p: number) => void, tracks?: StudioTracks) {
-  const { session, frames, player, grabber } = ctx;
-  const data = tracks ?? (await prepareStudio(grabber, session, frames, player, stroke, (p) => onProgress?.(p * 0.3)));
+export async function exportStudioVideo(ctx: CardContext, stroke: Stroke, onProgress?: (p: number) => void) {
+  const { session, frames, player } = ctx;
+  await loadStudioFonts();
+  const weight = weightTransfer(frames, stroke, player.hand);
   const W = 1080, H = 1920;
   const canvas = document.createElement('canvas');
   canvas.width = W;
   canvas.height = H;
-  const c2d = canvas.getContext('2d')!;
-  const { w: vw, h: vh } = await grabber.size();
-  const view: View = { ctx: c2d, W, H, vw, vh, crop: studioCrop(frames, stroke, player.hand, vw, vh, W / H) };
-  const rec = startRecording(canvas);
+  const view: Surface = { ctx: canvas.getContext('2d')!, W, H };
+  const scene = new StudioScene(W, H);
+  const writer = await createFrameWriter(canvas);
   const phases = stroke.phases;
   const slow = 1000 / (session.fps * 0.25);
-  const total = (stroke.endFrame - stroke.startFrame + 1) * 2 + phases.length + 2;
-  let step = 0;
-  const tick = () => onProgress?.(0.3 + (0.7 * ++step) / total);
-  const kicker = `${player.name} · ${STROKE_LABEL[stroke.type]}`;
+  const n = stroke.endFrame - stroke.startFrame + 1;
+  const total = 2.2 + n * (slow / 1000) * 1.5 + phases.length * 2.6 + 1.8;
+  const base = { frames, fps: session.fps, hand: player.hand, stroke, weight };
 
-  const show = async (i: number, header: Parameters<typeof drawHeader>[1], opts: Parameters<typeof drawStudioFrame>[7], ms: number) => {
-    const t0 = performance.now();
-    await grabber.at(frameTime(session, i), (video) => {
-      drawStudioFrame(view, video, frames, stroke, i, player.hand, data, opts);
-      drawHeader(view, header);
+  const show = async (i: number, ms: number, headline: Headline, callouts: Callout[] = [], ball = true) => {
+    await hold(writer, ms, (t) => {
+      renderStudio(view, scene, { ...base, i, ball, orbit: 0.22 * Math.sin(t / 9) }, { headline, callouts, gauge: shareAt(weight, i) });
     });
-    await wait(Math.max(0, ms - (performance.now() - t0)));
+    onProgress?.(Math.min(1, writer.time / total));
   };
-  const phaseHeader = (p: Phase, k: number) => ({ index: p.index, title: p.label, subtitle: phaseSubtitle(stroke, p), kicker, dots: { count: phases.length, active: k } });
 
-  await show(phases[0]?.frame ?? stroke.startFrame, { index: 0, title: STROKE_LABEL[stroke.type], subtitle: `Breakdown in ${phases.length} steps.`, kicker: player.name }, {}, 2000);
-  tick();
-  let prev = stroke.startFrame;
-  for (const [k, p] of phases.entries()) {
-    for (let i = prev; i < p.frame; i++) { await show(i, phaseHeader(p, k), { gauge: true }, slow); tick(); }
-    await show(p.frame, phaseHeader(p, k), { gauge: true, callouts: stroke.callouts.filter((c) => c.phaseId === p.id) }, 2400);
-    tick();
-    prev = p.frame;
+  try {
+    const fix = topFix(stroke);
+    const fixCallout = stroke.callouts.find((c) => c.status === 'fix' && !c.hidden);
+    await show(phases[0]?.frame ?? stroke.startFrame, 2200, {
+      kicker: fix ? 'The problem' : 'The breakdown',
+      line1: STROKE_LABEL[stroke.type],
+      line2: fixCallout ? `${fixCallout.label}.` : `${phases.length} steps.`,
+      tone: fixCallout ? 'fix' : 'good',
+      subtitle: fix?.text ?? `${player.name}, step by step.`,
+    }, [], false);
+    let prev = stroke.startFrame;
+    for (const p of phases) {
+      const h = phaseHeadline(stroke, p);
+      for (let i = prev; i < p.frame; i++) await show(i, slow, h);
+      await show(p.frame, 2600, h, phaseCallouts(stroke, p.id));
+      prev = p.frame;
+    }
+    const sum = transferSummary(weight, stroke.contactFrame);
+    const outro: Headline = {
+      kicker: 'The full swing',
+      line1: 'Full swing',
+      line2: sum ? `${Math.round(sum.load * 100)}% → ${Math.round(sum.drive * 100)}% front foot.` : undefined,
+      tone: 'good',
+      subtitle: transferLine(weight, stroke) ?? 'Racket path and ball flight.',
+    };
+    for (let i = stroke.startFrame; i <= stroke.endFrame; i++) await show(i, slow * 0.5, outro);
+    await show(stroke.endFrame, 1800, outro);
+  } finally {
+    scene.dispose();
   }
-  const summary = { index: 0, title: 'Full swing', subtitle: transferLine(data, stroke), kicker };
-  for (let i = stroke.startFrame; i <= stroke.endFrame; i++) { await show(i, summary, { gauge: true, ballTail: 40 }, slow * 0.5); tick(); }
-  await show(stroke.endFrame, summary, { gauge: true, ballTail: 40 }, 1500);
-  tick();
-  const { blob, ext } = await rec.stop();
+  const { blob, ext } = await writer.finish();
   return saveFile(blob, `${baseName(ctx, stroke)}-studio.${ext}`, [{ name: 'Video', extensions: [ext] }]);
 }
 
-export interface CompareSide extends CardContext {
+export interface CompareSide {
+  session: Session;
+  frames: PoseFrame[];
+  player: Player;
   stroke: Stroke;
   label: string;
 }
 
 /**
- * Two strokes side by side in the studio look, lined up at contact ("PRO | BEGINNER"),
- * pausing on each phase of the left stroke with both players' callouts.
+ * Two strokes side by side in the 3D studio, lined up at contact ("PRO | BEGINNER"),
+ * pausing on each phase of the left stroke with both players' rings and labels.
  */
 export async function exportStudioCompare(a: CompareSide, b: CompareSide, onProgress?: (p: number) => void) {
-  const tracksA = await prepareStudio(a.grabber, a.session, a.frames, a.player, a.stroke, (p) => onProgress?.(p * 0.15));
-  const tracksB = await prepareStudio(b.grabber, b.session, b.frames, b.player, b.stroke, (p) => onProgress?.(0.15 + p * 0.15));
+  await loadStudioFonts();
   const W = 1080, H = 1920;
-  const top = 440, panelH = 1300, panelW = W / 2;
+  const top = 600, panelW = W / 2, panelH = H - top - 60;
   const canvas = document.createElement('canvas');
   canvas.width = W;
   canvas.height = H;
   const out = canvas.getContext('2d')!;
-  // Compose each frame off screen so the recording never catches one half updated.
-  const buf = document.createElement('canvas');
-  buf.width = W;
-  buf.height = H;
-  const c2d = buf.getContext('2d')!;
-  const full: View = { ctx: c2d, W, H, vw: W, vh: H, crop: { sx: 0, sy: 0, sw: W, sh: H } };
-  const views = await Promise.all([a, b].map(async (s) => {
-    const { w: vw, h: vh } = await s.grabber.size();
-    return { ctx: c2d, W: panelW, H: panelH, vw, vh, crop: studioCrop(s.frames, s.stroke, s.player.hand, vw, vh, panelW / panelH) } as View;
-  }));
-  const rec = startRecording(canvas);
+  const scene = new StudioScene(panelW, panelH);
+  const weights = [weightTransfer(a.frames, a.stroke, a.player.hand), weightTransfer(b.frames, b.stroke, b.player.hand)];
+  const writer = await createFrameWriter(canvas);
   const phases = a.stroke.phases;
   const pre = Math.min(a.stroke.contactFrame - a.stroke.startFrame, Math.round(((b.stroke.contactFrame - b.stroke.startFrame) * a.session.fps) / b.session.fps));
   const post = Math.min(a.stroke.endFrame - a.stroke.contactFrame, Math.round(((b.stroke.endFrame - b.stroke.contactFrame) * a.session.fps) / b.session.fps));
   const slow = 1000 / (a.session.fps * 0.25);
-  const total = pre + post + 1;
 
-  const pane = async (s: CompareSide, k: number, i: number, tracks: StudioTracks, phaseId?: Phase['id']) => {
-    const x0 = k * panelW;
-    await s.grabber.at(frameTime(s.session, i), (video) => {
-      c2d.save();
-      c2d.beginPath(); c2d.rect(x0, top, panelW, panelH); c2d.clip();
-      c2d.translate(x0, top);
-      drawStudioFrame(views[k], video, s.frames, s.stroke, i, s.player.hand, tracks, {
-        callouts: phaseId ? s.stroke.callouts.filter((c) => c.phaseId === phaseId) : undefined,
-      });
-      c2d.restore();
+  const draw = (ia: number, ib: number, phase: Phase | undefined, held: boolean) => {
+    out.fillStyle = '#05070b';
+    out.fillRect(0, 0, W, H);
+    [a, b].forEach((s, k) => {
+      out.save();
+      out.translate(k * panelW, top);
+      out.beginPath(); out.rect(0, 0, panelW, panelH); out.clip();
+      renderStudio({ ctx: out, W: panelW, H: panelH }, scene,
+        { frames: s.frames, i: k === 0 ? ia : ib, fps: s.session.fps, hand: s.player.hand, stroke: s.stroke, weight: weights[k] },
+        { callouts: held && phase ? phaseCallouts(s.stroke, phase.id) : [] });
+      out.restore();
     });
+    drawHeadline({ ctx: out, W, H }, phase
+      ? phaseHeadline(a.stroke, phase)
+      : { kicker: `${a.label} vs ${b.label}`, line1: STROKE_LABEL[a.stroke.type], line2: 'Side by side.', tone: 'good' });
+    drawSideLabels(out, a.label, b.label, top, panelW, panelH);
   };
-  const show = async (ia: number, ib: number, phase: Phase | undefined, k: number, hold: boolean, ms: number) => {
-    const t0 = performance.now();
-    c2d.fillStyle = '#05070d';
-    c2d.fillRect(0, 0, W, H);
-    await pane(a, 0, ia, tracksA, hold ? phase?.id : undefined);
-    await pane(b, 1, ib, tracksB, hold ? phase?.id : undefined);
-    drawHeader(full, phase
-      ? { index: phase.index, title: phase.label, subtitle: phaseSubtitle(a.stroke, phase), dots: { count: phases.length, active: k } }
-      : { index: 0, title: STROKE_LABEL[a.stroke.type], subtitle: 'Same stroke, side by side.' });
-    drawSideLabels(c2d, a.label, b.label, top, panelW, panelH);
-    out.drawImage(buf, 0, 0);
-    await wait(Math.max(0, ms - (performance.now() - t0)));
-  };
+  const show = (ia: number, ib: number, phase: Phase | undefined, held: boolean, ms: number) => hold(writer, ms, () => draw(ia, ib, phase, held));
 
   const bFrame = (ia: number) => {
     const k = Math.round(((ia - a.stroke.contactFrame) * b.session.fps) / a.session.fps);
     return Math.max(b.stroke.startFrame, Math.min(b.stroke.endFrame, b.stroke.contactFrame + k));
   };
-  const startA = a.stroke.contactFrame - pre;
-  await show(startA, bFrame(startA), undefined, 0, false, 1500);
-  let k = 0;
-  for (let ia = startA; ia <= a.stroke.contactFrame + post; ia++) {
-    while (k < phases.length - 1 && phases[k + 1].frame <= ia) k++;
-    const phase = phases[k] && phases[k].frame <= ia ? phases[k] : undefined;
-    await show(ia, bFrame(ia), phase, k, false, slow);
-    if (phase && phase.frame === ia) {
-      // Hold on the phase: each player at their own frame for it.
-      const ib = b.stroke.phases.find((x) => x.id === phase.id)?.frame ?? bFrame(ia);
-      await show(ia, ib, phase, k, true, 2400);
+  try {
+    const startA = a.stroke.contactFrame - pre;
+    await show(startA, bFrame(startA), undefined, false, 1800);
+    let k = 0;
+    for (let ia = startA; ia <= a.stroke.contactFrame + post; ia++) {
+      while (k < phases.length - 1 && phases[k + 1].frame <= ia) k++;
+      const phase = phases[k] && phases[k].frame <= ia ? phases[k] : undefined;
+      await show(ia, bFrame(ia), phase, false, slow);
+      if (phase && phase.frame === ia) {
+        // Hold on the phase: each player at their own frame for it.
+        const ib = b.stroke.phases.find((x) => x.id === phase.id)?.frame ?? bFrame(ia);
+        await show(ia, ib, phase, true, 2400);
+      }
+      onProgress?.((ia - startA + 1) / (pre + post + 1));
     }
-    onProgress?.(0.3 + (0.7 * (ia - startA + 1)) / total);
+  } finally {
+    scene.dispose();
   }
-  const { blob, ext } = await rec.stop();
+  const { blob, ext } = await writer.finish();
   const name = slug(`${a.label} vs ${b.label} ${STROKE_LABEL[a.stroke.type]}`);
   return saveFile(blob, `${name}.${ext}`, [{ name: 'Video', extensions: [ext] }]);
 }
@@ -172,13 +191,12 @@ function drawSideLabels(ctx: CanvasRenderingContext2D, left: string, right: stri
   ctx.lineWidth = 3;
   ctx.beginPath(); ctx.moveTo(panelW, top); ctx.lineTo(panelW, top + panelH); ctx.stroke();
   ctx.shadowBlur = 0;
-  ctx.font = '800 34px Inter, system-ui, sans-serif';
+  ctx.font = '700 32px "Space Mono", ui-monospace, monospace';
   ctx.textBaseline = 'top';
-  ctx.letterSpacing = '8px';
-  ctx.fillStyle = '#d4f04c';
   ctx.textAlign = 'left';
-  ctx.fillText(left.toUpperCase(), 40, top + 30);
+  ctx.fillStyle = '#d4f04c';
+  ctx.fillText(left.toUpperCase().split('').join(' '), 36, top + 24);
   ctx.fillStyle = '#ffffff';
-  ctx.fillText(right.toUpperCase(), panelW + 40, top + 30);
+  ctx.fillText(right.toUpperCase().split('').join(' '), panelW + 36, top + 24);
   ctx.restore();
 }

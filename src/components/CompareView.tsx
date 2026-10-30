@@ -5,7 +5,6 @@ import { STROKE_LABEL, fmtDate } from '../labels';
 import { store, type Player, type Session, type SessionSummary } from '../storage/db';
 import { cropAround, drawSkeleton, drawTrail, drawVideo, type View } from '../render/overlay';
 import { canExportVideo } from '../render/export';
-import { FrameGrabber } from '../render/grabber';
 import { exportStudioCompare, type CompareSide } from '../render/reel';
 
 interface Choice { sessionId: string; strokeId: string }
@@ -130,15 +129,13 @@ export function CompareView({ playerId, strokeId }: { playerId: string; strokeId
 
   const exportSplit = async () => {
     if (!srcA || !srcB) return;
-    const grabbers = [new FrameGrabber(srcA.url), new FrameGrabber(srcB.url)];
-    const side = (s: Source, g: FrameGrabber, label: string): CompareSide => ({ grabber: g, session: s.session, frames: s.prepared.frames, player: s.player, stroke: s.stroke, label: label.trim() || s.player.name });
+    const side = (s: Source, label: string): CompareSide => ({ session: s.session, frames: s.prepared.frames, player: s.player, stroke: s.stroke, label: label.trim() || s.player.name });
     setBusy('Split video 0%');
     try {
-      await exportStudioCompare(side(srcA, grabbers[0], labels[0]), side(srcB, grabbers[1], labels[1]), (p) => setBusy(`Split video ${Math.round(p * 100)}%`));
+      await exportStudioCompare(side(srcA, labels[0]), side(srcB, labels[1]), (p) => setBusy(`Split video ${Math.round(p * 100)}%`));
     } catch (e: any) {
       alert(`Export failed: ${e?.message ?? e}`);
     } finally {
-      grabbers.forEach((g) => g.dispose());
       setBusy(null);
     }
   };

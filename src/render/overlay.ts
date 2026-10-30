@@ -211,7 +211,7 @@ export function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w
 }
 
 /** "1 UNIT TURN" header with a subtitle, like a breakdown card. An index of 0 hides the number. */
-export function drawHeader(v: View, opts: { index: number; title: string; subtitle?: string; kicker?: string; dots?: { count: number; active: number } }) {
+export function drawHeader(v: View, opts: { index: number; title: string; subtitle?: string; kicker?: string }) {
   const { ctx, W, H } = v;
   const s = W / 1080;
   const grad = ctx.createLinearGradient(0, 0, 0, H * 0.34);
@@ -242,8 +242,8 @@ export function drawHeader(v: View, opts: { index: number; title: string; subtit
   }
   ctx.textAlign = 'left';
   ctx.fillStyle = '#ffffff';
-  // Shrink long titles ("FOLLOW-THROUGH") so they never run into the step dots or off the edge.
-  const room = W - pad - titleX - (opts.dots ? (opts.dots.count - 1) * 24 * s + 44 * s + 30 * s : 0);
+  // Shrink long titles ("FOLLOW-THROUGH") so they never run off the edge.
+  const room = W - pad - titleX;
   ctx.font = `800 ${96 * s}px Inter, system-ui, sans-serif`;
   const size = Math.min(96 * s, (96 * s * room) / Math.max(1, ctx.measureText(opts.title.toUpperCase()).width));
   ctx.font = `800 ${size}px Inter, system-ui, sans-serif`;
@@ -259,23 +259,8 @@ export function drawHeader(v: View, opts: { index: number; title: string; subtit
   ctx.fillStyle = 'rgba(255,255,255,0.65)';
   ctx.font = `700 ${26 * s}px Inter, system-ui, sans-serif`;
   ctx.fillText('ANALYZED BY COURTSIDE', pad, y + 6 * s);
-  if (opts.dots) drawDots(ctx, W - pad, cy, s, opts.dots.count, opts.dots.active);
 }
 
-/** Step progress, right-aligned at (right, y): a pill for the current step, dots for the rest. */
-function drawDots(ctx: CanvasRenderingContext2D, right: number, y: number, s: number, count: number, active: number) {
-  const r = 7 * s, gap = 10 * s, pill = 44 * s;
-  let x = right - (count - 1) * (2 * r + gap) - pill;
-  ctx.save();
-  for (let i = 0; i < count; i++) {
-    const w = i === active ? pill : 2 * r;
-    ctx.fillStyle = i === active ? COLORS.accent : 'rgba(255,255,255,0.45)';
-    roundRect(ctx, x, y - r, w, 2 * r, r);
-    ctx.fill();
-    x += w + gap;
-  }
-  ctx.restore();
-}
 
 export function wrap(ctx: CanvasRenderingContext2D, text: string, maxW: number): string[] {
   const words = text.split(/\s+/);
